@@ -13,10 +13,12 @@ const byCodeUnits = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
 
 const ESCAPES = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
 const ESCAPE_TEST = /[&<>"']/;
+const ESCAPE_REPLACE = /[&<>"']/g;
+const escReplacer = (c) => ESCAPES[c];
 
 /** `text` with & < > " and ' escaped. */
 export function escapeHtml(text) {
-  return ESCAPE_TEST.test(text) ? text.replace(/[&<>"']/g, (c) => ESCAPES[c]) : text;
+  return ESCAPE_TEST.test(text) ? text.replace(ESCAPE_REPLACE, escReplacer) : text;
 }
 
 export const SLUG_MAX = 64;
@@ -303,30 +305,36 @@ function orderedOf(line) {
   return [Number(line.slice(0, i)), line.slice(i + 2)];
 }
 
+/** Whether the `what` at `j` is escaped: the backslashes immediately before it (from `from` on) pair up two by two,
+ * so an odd run escapes it. The scan from `from` reaches a run's start exactly, so this is the sequential scan's
+ * answer. */
+function isEscaped(s, j, from) {
+  let k = j - 1;
+  let odd = false;
+  while (k >= from && s.charCodeAt(k) === 92) {
+    odd = !odd;
+    k--;
+  }
+  return odd;
+}
+
 /** The first index from `from` where `s` holds `what` outside a backslash escape, or -1. */
 function findUnescaped(s, what, from) {
-  for (let j = from; j <= s.length - what.length; j++) {
-    const c = s.charCodeAt(j);
-    if (c === 92 && j + 1 < s.length && ESCAPABLE_TABLE[s.charCodeAt(j + 1)]) {
-      j++;
-      continue;
-    }
-    if (s.startsWith(what, j)) return j;
-  }
-  return -1;
+  let j = s.indexOf(what, from);
+  while (j !== -1 && isEscaped(s, j, from)) j = s.indexOf(what, j + 1);
+  return j;
 }
 
 /** The first single * from `from` (one whose run is not **), outside an escape, or -1. */
 function findSingleStar(s, from) {
-  for (let j = from; j < s.length; j++) {
-    const c = s.charCodeAt(j);
-    if (c === 92 && j + 1 < s.length && ESCAPABLE_TABLE[s.charCodeAt(j + 1)]) {
-      j++;
+  let j = s.indexOf('*', from);
+  while (j !== -1) {
+    if (isEscaped(s, j, from)) {
+      j = s.indexOf('*', j + 1);
       continue;
     }
-    if (c !== 42) continue;
     if (s.charCodeAt(j + 1) === 42) {
-      j++;
+      j = s.indexOf('*', j + 2);
       continue;
     }
     return j;
@@ -527,7 +535,7 @@ export function renderMarkdown(src, env) {
     if (excerpt === null) excerpt = html;
     blocks.push(`<p>${html}</p>`);
   }
-  return { html: blocks.map((b) => `${b}\n`).join(''), toc, excerpt: excerpt ?? '' };
+  return { html: blocks.length === 0 ? '' : `${blocks.join('\n')}\n`, toc, excerpt: excerpt ?? '' };
 }
 
 // ---------------------------------------------------------------- template.js
@@ -786,15 +794,16 @@ export function compileTemplate(name, nodes) {
 
 // ---------------------------------------------------------------- index.js (pipeline)
 
+/** Whitespace (JS \s) by char code, for wordsOf. */
+const WS_TABLE = new Uint8Array(65536);
+for (const c of [9, 10, 11, 12, 13, 32, 160, 5760, 8192, 8193, 8194, 8195, 8196, 8197, 8198, 8199, 8200, 8201, 8202, 8232, 8233, 8239, 8287, 12288, 65279]) WS_TABLE[c] = 1;
+
 /** The words of a body: its runs of characters other than whitespace (JS \s, no allocation). */
 function wordsOf(text) {
   let count = 0;
   let inWord = false;
   for (let i = 0; i < text.length; i++) {
-    const c = text.charCodeAt(i);
-    const ws = c === 32 || c === 9 || c === 10 || c === 13 || c === 11 || c === 12 || c === 160 || c === 5760 ||
-      (c >= 8192 && c <= 8202) || c === 8232 || c === 8233 || c === 8239 || c === 8287 || c === 12288 || c === 65279;
-    if (ws) inWord = false;
+    if (WS_TABLE[text.charCodeAt(i)]) inWord = false;
     else if (!inWord) {
       inWord = true;
       count++;
@@ -803,17 +812,27 @@ function wordsOf(text) {
   return count;
 }
 
-/** `rel` (a link's path, "/"-separated) from the directory parts `parts`, or null when it climbs out of the root. */
-function resolveFrom(parts, rel) {
-  const out = parts.slice();
+/** `rel` (a link's path, "/"-separated) from the directory `dir`, or null when it climbs out of the root. */
+function resolveFrom(dir, rel) {
+  if (!rel.includes('/')) {
+    if (rel === '.') return dir;
+    if (rel === '..') {
+      if (dir === '') return null;
+      const i = dir.lastIndexOf('/');
+      return i === -1 ? '' : dir.slice(0, i);
+    }
+    return dir === '' ? rel : `${dir}/${rel}`;
+  }
+  let out = dir;
   for (const seg of rel.split('/')) {
     if (seg === '' || seg === '.') continue;
     if (seg === '..') {
-      if (out.length === 0) return null;
-      out.pop();
-    } else out.push(seg);
+      if (out === '') return null;
+      const i = out.lastIndexOf('/');
+      out = i === -1 ? '' : out.slice(0, i);
+    } else out = out === '' ? seg : `${out}/${seg}`;
   }
-  return out.join('/');
+  return out;
 }
 
 const dirOf = (path) => (path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : '');
@@ -877,18 +896,30 @@ function permalinks(b) {
   }
 }
 
+/** Whether `target` opens on a scheme (`https:`, `mailto:` ...): a letter, then [A-Za-z0-9+.-]*, then ':'. */
+function hasScheme(target) {
+  const c0 = target.charCodeAt(0);
+  if (!((c0 >= 65 && c0 <= 90) || (c0 >= 97 && c0 <= 122))) return false;
+  const colon = target.indexOf(':');
+  if (colon === -1) return false;
+  for (let i = 1; i < colon; i++) {
+    const c = target.charCodeAt(i);
+    if (!((c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c === 43 || c === 45 || c === 46)) return false;
+  }
+  return true;
+}
+
 function markdown(b) {
   const staticPaths = new Set(b.statics.map((f) => f.path));
   for (const s of b.sources) {
     const dir = dirOf(s.path);
-    const dirParts = dir === '' ? [] : dir.split('/');
     const env = {
       link: (target) => {
-        if (/^[A-Za-z][A-Za-z0-9+.-]*:/.test(target) || target.startsWith('/') || target.startsWith('#')) return target;
+        if (hasScheme(target) || target.startsWith('/') || target.startsWith('#')) return target;
         const hash = target.indexOf('#');
         const rel = hash === -1 ? target : target.slice(0, hash);
         const frag = hash === -1 ? '' : target.slice(hash);
-        const path = rel === '' ? null : resolveFrom(dirParts, rel);
+        const path = rel === '' ? null : resolveFrom(dir, rel);
         if (path !== null && b.bySource.has(path)) return `${b.bySource.get(path).url}${frag}`;
         if (path !== null && staticPaths.has(path)) return `${b.base}/${path}${frag}`;
         b.broken.add(`broken-link ${s.path} -> ${target}`);
