@@ -13,7 +13,16 @@ const byCodeUnits = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
 
 const ESCAPES = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
 
+/** `text` with & < > " and ' escaped. Fast path when nothing needs escaping. */
 export function escapeHtml(text) {
+  const n = text.length;
+  let i = 0;
+  while (i < n) {
+    const c = text.charCodeAt(i);
+    if (c === 38 || c === 60 || c === 62 || c === 34 || c === 39) break;
+    i++;
+  }
+  if (i === n) return text;
   return text.replace(/[&<>"']/g, (c) => ESCAPES[c]);
 }
 
@@ -153,96 +162,118 @@ export function parseFrontMatter(text) {
 }
 
 // ---------------------------------------------------------------- markdown.js
+// Streaming single-pass renderer for makefun-site's Markdown subset: no
+// token objects, no per-character escapeHtml calls. Block structure follows
+// lib/markdown.js's lex() + renderMarkdown() exactly; inline() follows the
+// same left-to-right rules, but works on chunks (plain runs are pushed raw,
+// only the escapable / markup characters are handled one by one).
 
 const BLANK = /^[ \t]*$/;
-const FENCE_OPEN = /^```([A-Za-z0-9_+-]*)[ \t]*$/;
-const FENCE_CLOSE = /^```[ \t]*$/;
-const HEADING = /^(#{1,6})[ \t]+(.*?)[ \t]*$/;
 const HR = /^(?:---|\*\*\*)[ \t]*$/;
-const QUOTE = /^>/;
-const BULLET = /^[-*] (.*)$/;
-const ORDERED = /^(\d{1,9})\. (.*)$/;
 const CONTINUED = /^ {2,}\S/;
+const WS_TARGET = /\s/;
 
+/** HTML-escape lookup by char code (only & < > " ' change). */
+const HTML_ESC = [];
+HTML_ESC[38] = '&amp;';
+HTML_ESC[60] = '&lt;';
+HTML_ESC[62] = '&gt;';
+HTML_ESC[34] = '&quot;';
+HTML_ESC[39] = '&#39;';
+
+/** Backslash-escapable characters, by char code. */
+const ESCAPABLE_TABLE = new Uint8Array(128);
+for (const c of '\\`*_[]()#+-.!>') ESCAPABLE_TABLE[c.charCodeAt(0)] = 1;
+
+/** `text` with & < > " and ' escaped (same result as the regex version). */
+function escapeHtmlFast(text) {
+  const n = text.length;
+  let i = 0;
+  while (i < n) {
+    const c = text.charCodeAt(i);
+    if (c === 38 || c === 60 || c === 62 || c === 34 || c === 39) break;
+    i++;
+  }
+  if (i === n) return text;
+  const out = [text.slice(0, i)];
+  let start = i;
+  for (; i < n; i++) {
+    const rep = HTML_ESC[text.charCodeAt(i)];
+    if (rep !== undefined) {
+      if (i > start) out.push(text.slice(start, i));
+      out.push(rep);
+      start = i + 1;
+    }
+  }
+  if (start < n) out.push(text.slice(start));
+  return out.join('');
+}
+
+/** A fence-open line's language, or null. `^```([A-Za-z0-9_+-]*)[ \t]*$` */
+function fenceOpen(line) {
+  if (line.charCodeAt(0) !== 96 || line.charCodeAt(1) !== 96 || line.charCodeAt(2) !== 96) return null;
+  let i = 3;
+  while (i < line.length) {
+    const c = line.charCodeAt(i);
+    if ((c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c === 95 || c === 43 || c === 45) i++;
+    else break;
+  }
+  const lang = line.slice(3, i);
+  while (i < line.length && (line.charCodeAt(i) === 32 || line.charCodeAt(i) === 9)) i++;
+  return i === line.length ? lang : null;
+}
+
+/** Whether `line` closes a fence: `^```[ \t]*$`. */
+function fenceClose(line) {
+  if (line.charCodeAt(0) !== 96 || line.charCodeAt(1) !== 96 || line.charCodeAt(2) !== 96) return false;
+  let i = 3;
+  while (i < line.length && (line.charCodeAt(i) === 32 || line.charCodeAt(i) === 9)) i++;
+  return i === line.length;
+}
+
+/** A heading line's level and text, or null (a heading's text is never empty). */
 function headingOf(line) {
-  const m = HEADING.exec(line);
-  return m === null || m[2] === '' ? null : { depth: m[1].length, text: m[2] };
+  let hashes = 0;
+  while (hashes < line.length && line.charCodeAt(hashes) === 35) hashes++;
+  if (hashes === 0 || hashes > 6) return null;
+  let i = hashes;
+  if (i >= line.length || (line.charCodeAt(i) !== 32 && line.charCodeAt(i) !== 9)) return null;
+  while (i < line.length && (line.charCodeAt(i) === 32 || line.charCodeAt(i) === 9)) i++;
+  let end = line.length;
+  while (end > i && (line.charCodeAt(end - 1) === 32 || line.charCodeAt(end - 1) === 9)) end--;
+  if (end === i) return null;
+  return { depth: hashes, text: line.slice(i, end) };
 }
 
+/** Whether `line` ends a paragraph: a blank line, a fence, a heading or a thematic break. */
 function endsParagraph(line) {
-  return BLANK.test(line) || FENCE_OPEN.test(line) || headingOf(line) !== null || HR.test(line);
+  return BLANK.test(line) || fenceOpen(line) !== null || headingOf(line) !== null || HR.test(line);
 }
 
+/** A paragraph line as it is rendered: spaces and tabs at either end dropped. */
 const trimLine = (line) => line.replace(/^[ \t]+|[ \t]+$/g, '');
 
-export function lex(src) {
-  const lines = src.split('\n');
-  const tokens = [];
-  let i = 0;
-  while (i < lines.length) {
-    const line = lines[i];
-    if (BLANK.test(line)) {
-      i++;
-      continue;
-    }
-    const fence = FENCE_OPEN.exec(line);
-    if (fence !== null) {
-      const body = [];
-      i++;
-      while (i < lines.length && !FENCE_CLOSE.test(lines[i])) body.push(lines[i++]);
-      i++;
-      tokens.push({ type: 'code', lang: fence[1], lines: body });
-      continue;
-    }
-    const heading = headingOf(line);
-    if (heading !== null) {
-      tokens.push({ type: 'heading', depth: heading.depth, text: heading.text });
-      i++;
-      continue;
-    }
-    if (HR.test(line)) {
-      tokens.push({ type: 'hr' });
-      i++;
-      continue;
-    }
-    if (QUOTE.test(line)) {
-      const body = [];
-      while (i < lines.length && QUOTE.test(lines[i])) body.push(lines[i++].replace(/^> ?/, ''));
-      tokens.push({ type: 'blockquote', lines: body.map(trimLine).filter((l) => l !== '') });
-      continue;
-    }
-    const bullet = BULLET.exec(line);
-    const ordered = bullet === null ? ORDERED.exec(line) : null;
-    if (bullet !== null || ordered !== null) {
-      const isOrdered = ordered !== null;
-      const marker = isOrdered ? ORDERED : BULLET;
-      const items = [];
-      while (i < lines.length) {
-        const m = marker.exec(lines[i]);
-        if (m !== null) {
-          items.push([trimLine(isOrdered ? m[2] : m[1])]);
-          i++;
-        } else if (CONTINUED.test(lines[i])) {
-          items[items.length - 1].push(trimLine(lines[i]));
-          i++;
-        } else break;
-      }
-      tokens.push({ type: 'list', ordered: isOrdered, start: isOrdered ? Number(ordered[1]) : 1, items: items.map((parts) => parts.join('\n')) });
-      continue;
-    }
-    const body = [trimLine(line)];
-    i++;
-    while (i < lines.length && !endsParagraph(lines[i])) body.push(trimLine(lines[i++]));
-    tokens.push({ type: 'paragraph', text: body.join('\n') });
-  }
-  return tokens;
+/** A bullet-list line's item text, or null. `^[-*] (.*)$` */
+function bulletOf(line) {
+  const c = line.charCodeAt(0);
+  if ((c === 45 || c === 42) && line.charCodeAt(1) === 32) return line.slice(2);
+  return null;
 }
 
-const ESCAPABLE = new Set(['\\', '`', '*', '_', '[', ']', '(', ')', '#', '+', '-', '.', '!', '>']);
+/** An ordered-list line's [start, text], or null. `^(\d{1,9})\. (.*)$` */
+function orderedOf(line) {
+  let i = 0;
+  while (i < line.length && line.charCodeAt(i) >= 48 && line.charCodeAt(i) <= 57) i++;
+  if (i === 0 || i > 9) return null;
+  if (line.charCodeAt(i) !== 46 || line.charCodeAt(i + 1) !== 32) return null;
+  return [Number(line.slice(0, i)), line.slice(i + 2)];
+}
 
+/** The first index from `from` where `s` holds `what` outside a backslash escape, or -1. */
 function findUnescaped(s, what, from) {
   for (let j = from; j <= s.length - what.length; j++) {
-    if (s[j] === '\\' && j + 1 < s.length && ESCAPABLE.has(s[j + 1])) {
+    const c = s.charCodeAt(j);
+    if (c === 92 && j + 1 < s.length && ESCAPABLE_TABLE[s.charCodeAt(j + 1)]) {
       j++;
       continue;
     }
@@ -251,15 +282,16 @@ function findUnescaped(s, what, from) {
   return -1;
 }
 
+/** The first single * from `from` (one whose run is not **), outside an escape, or -1. */
 function findSingleStar(s, from) {
   for (let j = from; j < s.length; j++) {
-    const c = s[j];
-    if (c === '\\' && j + 1 < s.length && ESCAPABLE.has(s[j + 1])) {
+    const c = s.charCodeAt(j);
+    if (c === 92 && j + 1 < s.length && ESCAPABLE_TABLE[s.charCodeAt(j + 1)]) {
       j++;
       continue;
     }
-    if (c !== '*') continue;
-    if (s[j + 1] === '*') {
+    if (c !== 42) continue;
+    if (s.charCodeAt(j + 1) === 42) {
       j++;
       continue;
     }
@@ -268,106 +300,183 @@ function findSingleStar(s, from) {
   return -1;
 }
 
+/** `s` rendered inline; `env.link(target)` is a link's href. */
 export function inline(s, env) {
-  let out = '';
+  const out = [];
+  const n = s.length;
   let i = 0;
-  while (i < s.length) {
-    const c = s[i];
-    if (c === '\\' && i + 1 < s.length && ESCAPABLE.has(s[i + 1])) {
-      out += escapeHtml(s[i + 1]);
-      i += 2;
+  let plain = 0;
+  while (i < n) {
+    const c = s.charCodeAt(i);
+    if (c === 92) {
+      // backslash: escapes one of \ ` * _ [ ] ( ) # + - . ! >
+      if (i + 1 < n) {
+        const d = s.charCodeAt(i + 1);
+        if (d < 128 && ESCAPABLE_TABLE[d]) {
+          if (i > plain) out.push(s.slice(plain, i));
+          out.push(d === 62 ? '&gt;' : s[i + 1]);
+          i += 2;
+          plain = i;
+          continue;
+        }
+      }
+      i++;
       continue;
     }
-    if (c === '`') {
+    if (c === 96) {
       const j = s.indexOf('`', i + 1);
       if (j > i + 1) {
-        out += `<code>${escapeHtml(s.slice(i + 1, j))}</code>`;
+        if (i > plain) out.push(s.slice(plain, i));
+        out.push('<code>', escapeHtmlFast(s.slice(i + 1, j)), '</code>');
         i = j + 1;
-      } else {
-        out += '`';
-        i++;
-      }
+        plain = i;
+      } else i++;
       continue;
     }
-    if (c === '*') {
-      if (s[i + 1] === '*') {
+    if (c === 42) {
+      if (s.charCodeAt(i + 1) === 42) {
         const j = findUnescaped(s, '**', i + 2);
         if (j > i + 2) {
-          out += `<strong>${inline(s.slice(i + 2, j), env)}</strong>`;
+          if (i > plain) out.push(s.slice(plain, i));
+          out.push('<strong>', inline(s.slice(i + 2, j), env), '</strong>');
           i = j + 2;
-        } else {
-          out += '**';
-          i += 2;
-        }
+          plain = i;
+        } else i += 2;
         continue;
       }
       const j = findSingleStar(s, i + 1);
       if (j > i + 1) {
-        out += `<em>${inline(s.slice(i + 1, j), env)}</em>`;
+        if (i > plain) out.push(s.slice(plain, i));
+        out.push('<em>', inline(s.slice(i + 1, j), env), '</em>');
         i = j + 1;
-      } else {
-        out += '*';
-        i++;
-      }
+        plain = i;
+      } else i++;
       continue;
     }
-    if (c === '[') {
+    if (c === 91) {
       const k = findUnescaped(s, ']', i + 1);
-      const m = k !== -1 && s[k + 1] === '(' ? s.indexOf(')', k + 2) : -1;
+      const m = k !== -1 && s.charCodeAt(k + 1) === 40 ? s.indexOf(')', k + 2) : -1;
       const target = m === -1 ? '' : s.slice(k + 2, m);
-      if (target !== '' && !/\s/.test(target)) {
-        out += `<a href="${escapeHtml(env.link(target))}">${inline(s.slice(i + 1, k), env)}</a>`;
+      if (target !== '' && !WS_TARGET.test(target)) {
+        if (i > plain) out.push(s.slice(plain, i));
+        out.push('<a href="', escapeHtmlFast(env.link(target)), '">', inline(s.slice(i + 1, k), env), '</a>');
         i = m + 1;
-        continue;
-      }
-      out += '[';
-      i++;
+        plain = i;
+      } else i++;
       continue;
     }
-    out += escapeHtml(c);
+    if (c === 38 || c === 60 || c === 62 || c === 34 || c === 39) {
+      if (i > plain) out.push(s.slice(plain, i));
+      out.push(HTML_ESC[c]);
+      i++;
+      plain = i;
+      continue;
+    }
     i++;
   }
-  return out;
+  if (plain < n) out.push(s.slice(plain));
+  return out.join('');
 }
 
+/**
+ * `src` rendered: its HTML (each block on its own lines, a "\n" after the last), its table of contents (every level 2
+ * and 3 heading: level, id and its inline HTML) and its excerpt (the first paragraph's inline HTML, or "").
+ */
 export function renderMarkdown(src, env) {
+  const lines = src.split('\n');
+  const n = lines.length;
   const ids = new Set();
   const blocks = [];
   const toc = [];
   let excerpt = null;
-  for (const t of lex(src)) {
-    switch (t.type) {
-      case 'heading': {
-        const id = uniqueSlug(slugify(t.text), ids);
-        const html = inline(t.text, env);
-        blocks.push(`<h${t.depth} id="${id}">${html}</h${t.depth}>`);
-        if (t.depth === 2 || t.depth === 3) toc.push({ level: t.depth, id, html });
-        break;
-      }
-      case 'code': {
-        const cls = t.lang === '' ? '' : ` class="language-${escapeHtml(t.lang)}"`;
-        blocks.push(`<pre><code${cls}>${t.lines.map((l) => `${escapeHtml(l)}\n`).join('')}</code></pre>`);
-        break;
-      }
-      case 'hr':
-        blocks.push('<hr>');
-        break;
-      case 'blockquote':
-        blocks.push(t.lines.length === 0 ? '<blockquote>\n</blockquote>' : `<blockquote>\n<p>${inline(t.lines.join('\n'), env)}</p>\n</blockquote>`);
-        break;
-      case 'list': {
-        const tag = t.ordered ? 'ol' : 'ul';
-        const open = t.ordered && t.start !== 1 ? `<ol start="${t.start}">` : `<${tag}>`;
-        blocks.push(`${open}\n${t.items.map((item) => `<li>${inline(item, env)}</li>\n`).join('')}</${tag}>`);
-        break;
-      }
-      case 'paragraph': {
-        const html = inline(t.text, env);
-        if (excerpt === null) excerpt = html;
-        blocks.push(`<p>${html}</p>`);
-        break;
-      }
+  let i = 0;
+  while (i < n) {
+    const line = lines[i];
+    if (BLANK.test(line)) {
+      i++;
+      continue;
     }
+    const lang = fenceOpen(line);
+    if (lang !== null) {
+      i++;
+      const body = [];
+      while (i < n && !fenceClose(lines[i])) body.push(lines[i++]);
+      i++;
+      const cls = lang === '' ? '' : ` class="language-${escapeHtmlFast(lang)}"`;
+      let code = `<pre><code${cls}>`;
+      for (const l of body) {
+        code += escapeHtmlFast(l);
+        code += '\n';
+      }
+      blocks.push(`${code}</code></pre>`);
+      continue;
+    }
+    const heading = headingOf(line);
+    if (heading !== null) {
+      const id = uniqueSlug(slugify(heading.text), ids);
+      const html = inline(heading.text, env);
+      blocks.push(`<h${heading.depth} id="${id}">${html}</h${heading.depth}>`);
+      if (heading.depth === 2 || heading.depth === 3) toc.push({ level: heading.depth, id, html });
+      i++;
+      continue;
+    }
+    if (HR.test(line)) {
+      blocks.push('<hr>');
+      i++;
+      continue;
+    }
+    if (line.charCodeAt(0) === 62) {
+      const body = [];
+      while (i < n && lines[i].charCodeAt(0) === 62) {
+        let l = lines[i++];
+        l = l.slice(1);
+        if (l.charCodeAt(0) === 32) l = l.slice(1);
+        l = trimLine(l);
+        if (l !== '') body.push(l);
+      }
+      blocks.push(body.length === 0 ? '<blockquote>\n</blockquote>' : `<blockquote>\n<p>${inline(body.join('\n'), env)}</p>\n</blockquote>`);
+      continue;
+    }
+    const bullet = bulletOf(line);
+    const ordered = bullet === null ? orderedOf(line) : null;
+    if (bullet !== null || ordered !== null) {
+      const isOrdered = ordered !== null;
+      const items = [];
+      while (i < n) {
+        let m = null;
+        let text = null;
+        if (isOrdered) {
+          const o = orderedOf(lines[i]);
+          if (o !== null) {
+            m = o;
+            text = o[1];
+          }
+        } else {
+          text = bulletOf(lines[i]);
+          if (text !== null) m = true;
+        }
+        if (m !== null) {
+          items.push([trimLine(text)]);
+          i++;
+        } else if (CONTINUED.test(lines[i])) {
+          items[items.length - 1].push(trimLine(lines[i]));
+          i++;
+        } else break;
+      }
+      const tag = isOrdered ? 'ol' : 'ul';
+      const start = isOrdered ? ordered[0] : 1;
+      const open = isOrdered && start !== 1 ? `<ol start="${start}">` : `<${tag}>`;
+      let list = `${open}\n`;
+      for (const parts of items) list += `<li>${inline(parts.join('\n'), env)}</li>\n`;
+      blocks.push(`${list}</${tag}>`);
+      continue;
+    }
+    const body = [trimLine(line)];
+    i++;
+    while (i < n && !endsParagraph(lines[i])) body.push(trimLine(lines[i++]));
+    const html = inline(body.join('\n'), env);
+    if (excerpt === null) excerpt = html;
+    blocks.push(`<p>${html}</p>`);
   }
   return { html: blocks.map((b) => `${b}\n`).join(''), toc, excerpt: excerpt ?? '' };
 }

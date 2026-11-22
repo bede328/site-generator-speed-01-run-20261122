@@ -4,11 +4,12 @@
 // Usage: node scripts/run-driver.mjs <repoDir> <inputDir> <outputDir>
 
 import { mkdirSync } from 'node:fs';
+import { resolve } from 'node:path';
 
 const [repoDir, inputDir, outputDir] = process.argv.slice(2);
 process.env.MAKEFUN_INPUT_DIR = inputDir;
 process.env.MAKEFUN_OUTPUT_DIR = outputDir;
 mkdirSync(outputDir, { recursive: true });
-await import(`${repoDir}/main.ts`);
+await import(`${resolve(repoDir)}/main.ts`);
 const u = process.cpuUsage();
 console.log(JSON.stringify({ cpuMs: (u.user + u.system) / 1000 }));
