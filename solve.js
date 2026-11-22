@@ -642,6 +642,87 @@ export function renderNodes(nodes, scope, ctx, depth) {
   return out;
 }
 
+// ---------------------------------------------------------------- template codegen
+//
+// A parsed template compiles to fn(S, T, D, O, esc, txt, tru, has):
+//   S   the scope, a null-prototype object whose prototype is its parent
+//       scope (a for-loop's scope is Object.create(parent)); a path's first
+//       name is one property access down that chain, which is exactly the
+//       reference lookup's nearest-scope-with-the-name walk (an own property
+//       holding undefined shadows an outer one, as does hasOwn there).
+//   T   Map name -> compiled template function (missing templates absent).
+//   D   include depth; O the output array the function pushes into.
+// The compiled code is straight-line pushes plus direct property reads, so
+// it runs fast even before V8 optimises it; parse errors are unchanged
+// (parseTemplate still throws them with the reference messages).
+// renderNodes above stays as the fallback when a template cannot compile.
+
+/** A prototype-chain scope as the interpreter's {vars, parent} chain (fallback path only). */
+function scopeToOld(S) {
+  if (S === null) return null;
+  const vars = {};
+  for (const k of Object.keys(S)) vars[k] = S[k];
+  return { vars, parent: scopeToOld(Object.getPrototypeOf(S)) };
+}
+
+/** A compiled-template-shaped wrapper that renders `nodes` with the interpreter (used when codegen fails). */
+function makeFallbackFn(nodes, nodesMap) {
+  return function (S, T, D, O, esc) {
+    O.push(renderNodes(nodes, scopeToOld(S), { templates: nodesMap, escape: esc }, D));
+  };
+}
+
+/** The expression evaluating to the value at `path` in scope variable `sv`; `tmp` hands out temp names. */
+function lookupExpr(path, sv, tmp) {
+  if (path.length === 1) return `${sv}.${path[0]}`;
+  const v = tmp();
+  let expr = `(${v}=${sv}.${path[0]}`;
+  for (let k = 1; k < path.length; k++) {
+    expr += `,${v}=(${v}==null||typeof ${v}!=="object"||!has(${v},${JSON.stringify(path[k])}))?void 0:${v}.${path[k]}`;
+  }
+  return `${expr})`;
+}
+
+/** `nodes` compiled to a template function; throws when the generated code does not parse. */
+export function compileTemplate(name, nodes) {
+  let tmpCount = 0;
+  const tmp = () => `_t${tmpCount++}`;
+  const gen = (ns, depth, parts) => {
+    const sv = depth === 0 ? 'S' : `_s${depth}`;
+    for (const n of ns) {
+      if (n.kind === 'text') parts.push(`O.push(${JSON.stringify(n.text)});`);
+      else if (n.kind === 'var') parts.push(`O.push(esc(txt(${lookupExpr(n.path, sv, tmp)})));`);
+      else if (n.kind === 'raw') parts.push(`O.push(txt(${lookupExpr(n.path, sv, tmp)}));`);
+      else if (n.kind === 'if') {
+        const cond = `tru(${lookupExpr(n.path, sv, tmp)})`;
+        const thenParts = [];
+        const elseParts = [];
+        gen(n.then, depth, thenParts);
+        if (n.else !== null) gen(n.else, depth, elseParts);
+        if (n.not) {
+          if (n.else !== null) parts.push(`if(${cond}){${elseParts.join('')}}else{${thenParts.join('')}}`);
+          else parts.push(`if(!(${cond})){${thenParts.join('')}}`);
+        } else if (n.else !== null) parts.push(`if(${cond}){${thenParts.join('')}}else{${elseParts.join('')}}`);
+        else parts.push(`if(${cond}){${thenParts.join('')}}`);
+      } else if (n.kind === 'for') {
+        const xs = tmp();
+        const kk = tmp();
+        const nsv = `_s${depth + 1}`;
+        parts.push(`{var ${xs}=${lookupExpr(n.path, sv, tmp)};if(Array.isArray(${xs})){for(var ${kk}=0;${kk}<${xs}.length;${kk}++){var ${nsv}=Object.create(${sv});${nsv}.${n.name}=${xs}[${kk}];${nsv}.loop={index:${kk}+1,first:${kk}===0,last:${kk}===${xs}.length-1,length:${xs}.length};`);
+        gen(n.body, depth + 1, parts);
+        parts.push('}}}');
+      } else if (n.kind === 'include') {
+        const f = tmp();
+        parts.push(`{var ${f}=T.get(${JSON.stringify(n.name)});if(${f}!==undefined&&D<8)${f}(${sv},T,D+1,O,esc,txt,tru,has);}`);
+      }
+    }
+  };
+  const parts = [];
+  gen(nodes, 0, parts);
+  const decls = tmpCount === 0 ? '' : `var ${Array.from({ length: tmpCount }, (_, i) => `_t${i}`).join(',')};`;
+  return new Function('S', 'T', 'D', 'O', 'esc', 'txt', 'tru', 'has', decls + parts.join(''));
+}
+
 // ---------------------------------------------------------------- index.js (pipeline)
 
 function wordsOf(text) {
@@ -810,10 +891,18 @@ function layouts(b) {
   const site = { title: b.input.site.title, base_url: b.base };
   const allTags = b.tags.map((t) => ({ name: t.name, slug: t.slug, url: t.url, count: t.posts.length }));
   const recent = b.posts.slice(0, b.input.site.recent).map((p) => b.cards.get(p));
-  const ctx = { templates: b.templates, escape: escapeHtml };
+  const fns = b.templateFns;
   const render = (name, vars) => {
-    const nodes = b.templates.get(name);
-    return nodes === undefined ? null : renderNodes(nodes, { vars: { site, tags: allTags, recent, ...vars }, parent: null }, ctx, 0);
+    const fn = fns.get(name);
+    if (fn === undefined) return null;
+    const S = Object.create(null);
+    S.site = site;
+    S.tags = allTags;
+    S.recent = recent;
+    for (const k in vars) S[k] = vars[k];
+    const out = [];
+    fn(S, fns, 0, out, escapeHtml, textOf, truthy, Object.hasOwn);
+    return out.join('');
   };
   for (const s of b.sources) b.output[`${s.outDir}/index.html`] = render(s.layout, { page: pageOf(s) });
   const per = b.input.site.per_page;
@@ -849,19 +938,29 @@ export const PIPELINE = Object.freeze([readSources, frontMatter, permalinks, mar
 
 export function build(input) {
   const templates = new Map();
+  const templateFns = new Map();
   const report = [];
   for (const name of Object.keys(input.templates).sort(byCodeUnits)) {
+    let nodes;
     try {
-      templates.set(name, parseTemplate(name, input.templates[name]));
+      nodes = parseTemplate(name, input.templates[name]);
     } catch (err) {
       if (!(err instanceof TemplateError)) throw err;
       report.push(err.message);
+      continue;
+    }
+    templates.set(name, nodes);
+    try {
+      templateFns.set(name, compileTemplate(name, nodes));
+    } catch {
+      templateFns.set(name, makeFallbackFn(nodes, templates));
     }
   }
   const b = {
     input,
     base: input.site.base_url.replace(/\/+$/, ''),
     templates,
+    templateFns,
     sources: [],
     statics: [],
     bySource: new Map(),
