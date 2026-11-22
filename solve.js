@@ -911,21 +911,27 @@ function hasScheme(target) {
 
 function markdown(b) {
   const staticPaths = new Set(b.statics.map((f) => f.path));
+  // One link function and one env object for the whole build: a fresh
+  // closure per source would make inline()'s env.link call site see a
+  // different function every time (megamorphic, and it deoptimises the
+  // inlined call). The per-source state lives in linkState, set before
+  // each source renders; rendering is synchronous, so it cannot interleave.
+  const linkState = { dir: '', path: '' };
+  const link = (target) => {
+    if (hasScheme(target) || target.startsWith('/') || target.startsWith('#')) return target;
+    const hash = target.indexOf('#');
+    const rel = hash === -1 ? target : target.slice(0, hash);
+    const frag = hash === -1 ? '' : target.slice(hash);
+    const path = rel === '' ? null : resolveFrom(linkState.dir, rel);
+    if (path !== null && b.bySource.has(path)) return `${b.bySource.get(path).url}${frag}`;
+    if (path !== null && staticPaths.has(path)) return `${b.base}/${path}${frag}`;
+    b.broken.add(`broken-link ${linkState.path} -> ${target}`);
+    return target;
+  };
+  const env = { link };
   for (const s of b.sources) {
-    const dir = dirOf(s.path);
-    const env = {
-      link: (target) => {
-        if (hasScheme(target) || target.startsWith('/') || target.startsWith('#')) return target;
-        const hash = target.indexOf('#');
-        const rel = hash === -1 ? target : target.slice(0, hash);
-        const frag = hash === -1 ? '' : target.slice(hash);
-        const path = rel === '' ? null : resolveFrom(dir, rel);
-        if (path !== null && b.bySource.has(path)) return `${b.bySource.get(path).url}${frag}`;
-        if (path !== null && staticPaths.has(path)) return `${b.base}/${path}${frag}`;
-        b.broken.add(`broken-link ${s.path} -> ${target}`);
-        return target;
-      },
-    };
+    linkState.dir = dirOf(s.path);
+    linkState.path = s.path;
     const md = renderMarkdown(s.body, env);
     s.html = md.html;
     s.toc = md.toc;
@@ -967,6 +973,9 @@ const linkOf = (s) => (s === null ? null : { title: s.data.title, url: s.url, da
 
 const tagOf = (b, t) => ({ name: t.name, slug: t.slug, url: t.url, count: t.posts.length, posts: t.posts.map((p) => b.cards.get(p)) });
 
+/** A tag reference as a card reads it (a shared callback, not a fresh closure per card). */
+const tagRefOf = (t) => ({ name: t.name, slug: t.slug, url: t.url });
+
 function cardOf(s) {
   if (s.card !== undefined) return s.card;
   const card = {
@@ -977,7 +986,7 @@ function cardOf(s) {
     summary: s.data.summary ?? '',
     excerpt: s.excerpt,
     reading_minutes: Math.max(1, Math.ceil(wordsOf(s.body) / 200)),
-    tags: s.tagRefs.map((t) => ({ name: t.name, slug: t.slug, url: t.url })),
+    tags: s.tagRefs.map(tagRefOf),
   };
   s.card = card;
   return card;
