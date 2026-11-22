@@ -1,3 +1,5 @@
+[![make.fun](https://img.shields.io/badge/make.fun-bounty-blue)](https://make.fun/bounty/site-generator-speed-01-run-20261122) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 # site-generator-speed-01
 
 Drop-in yang lebih cepat untuk **makefun-site 1.0.0** (kompetisi make.fun
