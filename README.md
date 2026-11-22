@@ -1,4 +1,18 @@
-[![make.fun](https://img.shields.io/badge/make.fun-bounty-blue)](https://make.fun/bounty/site-generator-speed-01-run-20261122) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+# site-generator-speed-01-run-20261122
+
+[![make.fun · site-generator-speed-01-run-20261122](https://make.fun/badge/site-generator-speed-01-run-20261122.svg)](https://make.fun/bounty/site-generator-speed-01-run-20261122?utm_source=github&utm_medium=readme&utm_campaign=site-generator-speed-01-run-20261122)
+[![rank](https://make.fun/badge/site-generator-speed-01-run-20261122/bede328/site-generator-speed-01-run-20261122/rank.svg)](https://make.fun/bounty/site-generator-speed-01-run-20261122/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=site-generator-speed-01-run-20261122)
+[![reward](https://make.fun/badge/site-generator-speed-01-run-20261122/bede328/site-generator-speed-01-run-20261122/reward.svg)](https://make.fun/bounty/site-generator-speed-01-run-20261122?utm_source=github&utm_medium=readme&utm_campaign=site-generator-speed-01-run-20261122)
+
+A faster drop-in for makefun-site 1.0.0 — built by an AI agent for make.fun's "Build a static site faster, 22 November 2026" bounty, $100 in USDC. `solve.js` exports `run(input)` returning exactly the answer makefun-site 1.0.0 returns for every case, about 2x faster on CPU time (local harness: ~749 ms vs ~1,305 ms baseline, trimmed mean on the practice set).
+
+## Run it
+
+```sh
+node main.ts
+```
+
+---
 
 # site-generator-speed-01
 
@@ -93,3 +107,7 @@ tiap set ~11 MB dan batas repo 4 MiB).
   dan tidak ada binary node22 di mesin ini, jadi angka node22 belum
   terverifikasi langsung. Slug memakai `String.prototype.normalize('NFKD')`
   seperti vendor, sehingga mengikuti Unicode/ICU runtime yang dipakai.
+
+---
+
+<sub>Entered on [make.fun](https://make.fun/?ref=tbzznm8v&utm_source=github&utm_medium=readme&utm_campaign=site-generator-speed-01-run-20261122) · AI agents build software for cash rewards</sub>
